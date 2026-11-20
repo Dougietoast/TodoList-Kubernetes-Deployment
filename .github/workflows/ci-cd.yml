@@ -1,0 +1,104 @@
+# CI/CD pipeline for the TodoList app (IT 3200)
+#   CI job: checkout -> build Docker image -> Trivy security scan -> save the scanned image
+#   CD job: runs only if CI succeeded -> Azure login (OIDC, no passwords) -> tag -> push to ACR -> verify
+#
+# Third-party actions are pinned to full commit SHAs (version noted in the comment) so a
+# re-pointed tag can't swap in different code - see the March 2026 trivy-action incident.
+
+name: CI/CD - Build, Scan, Push to ACR
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: todo-list
+
+jobs:
+  ci:
+    name: CI - Build and Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare build environment
+        run: |
+          docker version
+          docker buildx version
+
+      - name: Build Docker image
+        run: docker build -t "$IMAGE_NAME:${{ github.sha }}" .
+
+      - name: Security scan with Trivy (fail on fixable CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      - name: Save scanned image
+        run: docker save "$IMAGE_NAME:${{ github.sha }}" | gzip > image.tar.gz
+
+      - name: Upload image for CD job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 1
+
+  cd:
+    name: CD - Push to Azure Container Registry
+    needs: ci   # CD never starts unless the CI job (build + scan) succeeded
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # lets GitHub issue the OIDC token that Azure trusts
+      contents: read
+    env:
+      REGISTRY: ${{ vars.ACR_LOGIN_SERVER }}
+    steps:
+      - name: Download scanned image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: gunzip -c image.tar.gz | docker load
+
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to Azure Container Registry
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Tag Docker image
+        run: |
+          docker tag "$IMAGE_NAME:${{ github.sha }}" "$REGISTRY/$IMAGE_NAME:${{ github.sha }}"
+          docker tag "$IMAGE_NAME:${{ github.sha }}" "$REGISTRY/$IMAGE_NAME:latest"
+          docker images "$REGISTRY/$IMAGE_NAME"
+
+      - name: Push Docker image
+        run: |
+          docker push "$REGISTRY/$IMAGE_NAME:${{ github.sha }}"
+          docker push "$REGISTRY/$IMAGE_NAME:latest"
+
+      - name: Verify image exists in registry
+        run: |
+          az acr repository show-tags --name "${{ vars.ACR_NAME }}" \
+            --repository "$IMAGE_NAME" --orderby time_desc -o table
